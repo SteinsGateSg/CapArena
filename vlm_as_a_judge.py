@@ -2,56 +2,60 @@
 import os
 import time
 import json
-import requests
-import base64
+import torch
 from tqdm import tqdm
 import re
 import argparse
 import shutil
+from PIL import Image
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 
-# Helper functions for image encoding
-def encode_image(image_content):
-    return base64.b64encode(image_content).decode('utf-8')
+_MODEL = None
+_PROCESSOR = None
 
 
-def convert_image_to_base64(image_path):
-    with open(image_path, 'rb') as f:
-        image_bytes = f.read()
-        return encode_image(image_bytes)
+# Helper functions for image loading
+def load_image(image_path):
+    return Image.open(image_path).convert("RGB")
 
 
-# Function to call OpenAI API
-def call_llm(model_name, payload):
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"
-    }
-    print("Generating content with GPT model: {}".format(model_name))
-    response = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers=headers,
-        json={**payload, "temperature": 0.1}
+def get_model_and_processor(model_id):
+    global _MODEL, _PROCESSOR
+    if _MODEL is None or _PROCESSOR is None:
+        _PROCESSOR = AutoProcessor.from_pretrained(model_id)
+        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        _MODEL = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            device_map="auto"
+        )
+        _MODEL.eval()
+    return _MODEL, _PROCESSOR
+
+
+# Function to call local Qwen2.5-VL model
+def call_llm(model_id, messages, image, max_tokens=1500, top_p=0.9, temperature=0.5):
+    model, processor = get_model_and_processor(model_id)
+    print("Generating content with local model: {}".format(model_id))
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
     )
-    if response.status_code != 200:
-        if response.json()['error']['code'] == "context_length_exceeded":
-            print("Context length exceeded. Retrying with a smaller context.")
-            payload["messages"] = [payload["messages"][0]] + payload["messages"][-1:]
-            retry_response = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json={**payload, "temperature": 0.1}
-            )
-            if retry_response.status_code != 200:
-                print(
-                    "Failed to call LLM even after attempt on shortening the history: " + retry_response.text)
-                return ""
-
-        print("Failed to call LLM: " + response.text)
-        time.sleep(2)
-        return ""
-    else:
-        return response.json()['choices'][0]['message']['content']
+    inputs = processor(
+        text=[text],
+        images=[image],
+        return_tensors="pt"
+    ).to(model.device)
+    generated_ids = model.generate(
+        **inputs,
+        max_new_tokens=max_tokens,
+        do_sample=True,
+        top_p=top_p,
+        temperature=temperature
+    )
+    return processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
 
 # Calculate agreement between model predictions and human judgments
@@ -187,7 +191,7 @@ Reason: <your thoughts and reasoning process for the judgment>
 Judgment: <Caption 1 is better>/<Caption 2 is better>/<Tie>
 """
 
-def mllm_judge_pairs(caption_eval_cand_dir, imgs_dir, with_ref=True, cal_agree=True, eval_model_name=None):
+def mllm_judge_pairs(caption_eval_cand_dir, imgs_dir, with_ref=True, cal_agree=True, eval_model_name=None, model_id=None):
 
     caption_eval_cand = json.load(open(caption_eval_cand_dir, 'r'))
     print(f"Num of All Caption Pair: {len(caption_eval_cand)}")
@@ -211,7 +215,7 @@ def mllm_judge_pairs(caption_eval_cand_dir, imgs_dir, with_ref=True, cal_agree=T
         img_path = os.path.join(imgs_dir, img_filename)
         if not os.path.exists(img_path):
             print("img not exist")
-        image = convert_image_to_base64(img_path)
+        image = load_image(img_path)
 
         caption_1 = item["caption1"]
         caption_2 = item["caption2"]
@@ -226,50 +230,32 @@ def mllm_judge_pairs(caption_eval_cand_dir, imgs_dir, with_ref=True, cal_agree=T
 
         messages.append({
             "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": system_prompt_with_ref if with_ref else system_prompt_without_ref
-                },
-            ]
+            "content": system_prompt_with_ref if with_ref else system_prompt_without_ref
         })
-
-        action_text_image = []
-        action_text_image.append(
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{image}",
-                    "detail": "high"
-                }
-            }
-        )
-        action_text_image.append(
-            {
-                "type": "text",
-                "text": compare_prompt
-            }
-        )
 
         messages.append({
             "role": "user",
-            "content": action_text_image
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": compare_prompt}
+            ]
         })
 
         print(compare_prompt)
 
-        model_name = "gpt-4o-2024-08-06"
+        model_name = model_id
         try_num = 0
         while try_num < 5:
             try_num += 1
             try:
-                response = call_llm(model_name, {
-                    "model": model_name,
-                    "messages": messages,
-                    "max_tokens": 1500,
-                    "top_p": 0.9,
-                    "temperature": 0.5
-                })
+                response = call_llm(
+                    model_id=model_name,
+                    messages=messages,
+                    image=image,
+                    max_tokens=1500,
+                    top_p=0.9,
+                    temperature=0.5
+                )
             except:
                 print("error call")
                 time.sleep(1.0)
@@ -314,6 +300,7 @@ def main():
     parser.add_argument('--with_ref', type=bool, default=True, help='Whether to use reference captions for evaluation')
     parser.add_argument('--cal_agree', type=bool, default=True, help='Whether to calculate agreement')
     parser.add_argument('--eval_model_name', type=str, default=None, help='Name of evaluation model')
+    parser.add_argument('--model_id', type=str, default="Qwen/Qwen2.5-VL-7B-Instruct", help='Local Qwen2.5-VL model id or path')
 
     args = parser.parse_args()
     # Copy original evaluation file to new save path
@@ -325,7 +312,8 @@ def main():
         imgs_dir=args.imgs_dir,
         with_ref=args.with_ref,
         cal_agree=args.cal_agree,
-        eval_model_name=args.eval_model_name
+        eval_model_name=args.eval_model_name,
+        model_id=args.model_id
     )
 
 if __name__ == "__main__":
