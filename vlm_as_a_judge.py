@@ -8,7 +8,7 @@ import re
 import argparse
 import shutil
 from PIL import Image
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 
 
 _MODEL = None
@@ -25,7 +25,7 @@ def get_model_and_processor(model_id):
     if _MODEL is None or _PROCESSOR is None:
         _PROCESSOR = AutoProcessor.from_pretrained(model_id)
         torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        _MODEL = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        _MODEL = LlavaOnevisionForConditionalGeneration.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
             device_map="auto"
@@ -34,7 +34,7 @@ def get_model_and_processor(model_id):
     return _MODEL, _PROCESSOR
 
 
-# Function to call local Qwen2.5-VL model
+# Function to call local LLaVA-OneVision model
 def call_llm(model_id, messages, image, max_tokens=1500, top_p=0.9, temperature=0.5):
     model, processor = get_model_and_processor(model_id)
     print("Generating content with local model: {}".format(model_id))
@@ -300,7 +300,7 @@ def main():
     parser.add_argument('--with_ref', type=bool, default=True, help='Whether to use reference captions for evaluation')
     parser.add_argument('--cal_agree', type=bool, default=True, help='Whether to calculate agreement')
     parser.add_argument('--eval_model_name', type=str, default=None, help='Name of evaluation model')
-    parser.add_argument('--model_id', type=str, default="Qwen/Qwen2.5-VL-7B-Instruct", help='Local Qwen2.5-VL model id or path')
+    parser.add_argument('--model_id', type=str, default="llava-onevision-1.5-8b-instruct", help='Local LLaVA-OneVision model id or path')
 
     args = parser.parse_args()
     # Copy original evaluation file to new save path
